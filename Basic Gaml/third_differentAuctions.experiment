@@ -1,0 +1,263 @@
+model CommunicationBetweenAgents
+
+// https://gama-platform.org/wiki/InteractionBetweenAgents
+
+// 'avsluta' auktionen, ska vi typ göra någon close-meddelande?
+// en till auktion?
+
+global {
+	int numberOfAuctioneers <- 1;
+	int numberOfParticipants <- 5;
+	init {
+		create Auctioneer number: numberOfAuctioneers;
+		create Participant number: numberOfParticipants;
+				
+		loop counter from: 1 to: numberOfParticipants {
+        	Participant my_agent <- Participant[counter - 1];
+        	my_agent <- my_agent.setName(counter);
+        }
+	}
+}
+
+species Auctioneer skills: [fipa] {
+	int itemPriceDutchAuction <- rnd(2000, 10000);
+	int itemPriceSealedBidAuction <- rnd(1000, 7000);
+	int itemPriceFloor <- 1999;
+	int decreaseItemPriceVariable <- 500;
+	int itemPriceJapaneseAuction <- -250;
+	
+	message messageFromReceiver;
+	
+	bool foundBuyer <- false;
+	bool firstRun <- true;
+	
+	list<Participant> japaneseList;
+	list<string> auctionVariants <- ["sealedBidAuction", "dutchAuction", "japaneseAuction"];
+	string auctionType <- "japaneseAuction";
+	//string chosenAuctionType <- one_of(auctionVariants);
+	
+	reflex inform_auction_start when: (time = 1) {
+		list<Participant> pList;
+		loop counter from: 1 to: numberOfParticipants {
+        	add Participant[counter - 1] to: pList;
+        } 
+        write "Informing all participants of " + auctionType + " start";
+		do start_conversation (to :: pList, protocol :: 'fipa-contract-net', performative :: 'inform', contents :: ['Starting a new auction', auctionType] );
+	}
+	
+	// ======================================= DUTCH AUCTION ========================================================
+		
+	reflex dutch_auction_bid_cycle when: (time mod 5 = 0) and !foundBuyer and time != 0 and auctionType = "dutchAuction" {
+		list<Participant> pList;
+		
+		if(!firstRun and (itemPriceDutchAuction-decreaseItemPriceVariable) > itemPriceFloor){
+			write "new round of auction";
+			itemPriceDutchAuction <- itemPriceDutchAuction - decreaseItemPriceVariable;
+		} else if ((itemPriceDutchAuction-500) <= itemPriceFloor){
+			write "price is lower than floor, " + itemPriceFloor + ", cancelling new auctions";
+			foundBuyer <- true; // no new auctions
+		}
+		
+		loop counter from: 1 to: numberOfParticipants {
+        	add Participant[counter - 1] to: pList;
+        } 
+        
+        if(!foundBuyer){ // price is too low, so we dont send out any more offers
+        	write  "(Time " + string(time) + " ): " + "Auctioneer sends a cfp message to all participants selling for " + itemPriceDutchAuction;
+        	do start_conversation (to :: pList, protocol :: 'fipa-contract-net', performative :: 'cfp', contents :: ['Selling for price', itemPriceDutchAuction] );
+        }
+        
+        firstRun <- false;
+	}
+	
+	// https://www.investopedia.com/terms/s/sealed-bid-auction.asp
+	// There can be instances where the highest bid is not chosen by the seller. 
+	// This may occur if the offers do not meet the seller’s needs and expectations.
+	
+	reflex dutch_handle_proposals when: !empty(proposes) and !foundBuyer and auctionType = "dutchAuction" {
+		loop p over: proposes {
+			message fromParticipant <- p;
+			list contentFromParticipant <- p.contents;
+			
+			int proposedPrice <- contentFromParticipant[1];
+			
+			if((proposedPrice >= itemPriceDutchAuction) and !foundBuyer ){ // we have a buyer
+				foundBuyer <- true;
+				do accept_proposal with: (message: p, contents: ['Accepted price ', itemPriceDutchAuction]);
+				
+			} else if ((proposedPrice < itemPriceDutchAuction) or foundBuyer ) { // refuse the buyer
+				do reject_proposal with: (message: p, contents: ['Rejected price ', proposedPrice]);
+			}
+		}
+	}	
+	// ======================================== SEALED BID AUCTION =================================================
+	
+	reflex sealed_bid_cfp when: (time = 5) and auctionType = "sealedBidAuction"{
+		list<Participant> pList;
+		
+		loop counter from: 1 to: numberOfParticipants {
+        	add Participant[counter - 1] to: pList;
+        } 
+        
+        write "sending out a " + auctionType + " call for bids";
+        do start_conversation (to :: pList, protocol :: 'fipa-contract-net', performative :: 'cfp', contents :: ['Selling for price', itemPriceSealedBidAuction] );
+	}
+	
+	reflex sealed_bid_handle_proposals when: !empty(proposes) and auctionType = "sealedBidAuction" {
+		list<int> bids;
+		list<message> messageList;
+		int maxBid <- 0;
+		int temp;
+		message associatedMessage;
+		
+		loop p over: proposes {
+			message fromParticipant <- p;
+			list contentFromParticipant <- p.contents; // price bid
+			
+			add contentFromParticipant[1] to: bids;
+			add p to: messageList;
+			
+			temp <- contentFromParticipant[1];
+			
+			if(temp > maxBid) {
+				maxBid <- temp;
+				associatedMessage <- p;
+			}
+		}
+		
+		messageList <- (messageList - associatedMessage);
+		
+		do accept_proposal with: (message: associatedMessage, contents: ['Accepted price from', associatedMessage.sender]);
+		
+		loop p over: messageList {
+			do reject_proposal with: (message: p, contents: ['Rejected price from', p.sender]);
+		}
+		
+		write "ending auction with winner: " + associatedMessage.sender + ", buying the item for : " + maxBid;
+	}
+	
+	// =========================================== JAPANESE AUCTION =================================================
+	
+	reflex japanese_auction_bid_cycle when: (time mod 5 = 0) and !foundBuyer and time != 0 and auctionType = "japaneseAuction" {
+		
+		if(firstRun){			
+			loop counter from: 1 to: numberOfParticipants {
+	        	add Participant[counter - 1] to: japaneseList;
+	        } 
+		}
+		firstRun <- false;
+		
+		itemPriceJapaneseAuction <- itemPriceJapaneseAuction + 250;
+		write "beginning round of auction at price " + itemPriceJapaneseAuction;
+		
+		// people still here?
+        
+        
+        do start_conversation (to :: japaneseList, protocol :: 'fipa-contract-net', performative :: 'cfp', contents :: ['New round of japanese auction. Current price: ', itemPriceJapaneseAuction] );
+	}
+	
+	reflex japanese_auction_handle_proposals when: !empty(proposes) and auctionType = "japaneseAuction" and !foundBuyer {
+		loop p over: proposes {
+			message fromAuctioneer <- p;
+			list contentFromAuctioneer <- p.contents;
+			bool stayBool <- contentFromAuctioneer[1];
+			int willingPrice <- contentFromAuctioneer[2];
+			
+			if(stayBool){
+				
+				if(length(japaneseList) = 1){ // you have won
+					do accept_proposal with: (message: p, contents: ['Participant has won: ', p.sender, willingPrice]);
+					foundBuyer <- true;
+				} else { // you are still competing
+					do accept_proposal with: (message: p, contents: ['Participant is staying: ', p.sender, willingPrice]);
+				}
+				
+			} else {	
+				
+				if(length(japaneseList) > 1){ // you may leave
+					japaneseList <- (japaneseList - p.sender);					
+					do reject_proposal with: (message: p, contents: ['Participant is leaving: ', p.sender, willingPrice]);
+				} else { // you have already won, thus you must pay
+					do accept_proposal with: (message: p, contents: ['Participant has won: ', p.sender, willingPrice]);
+					foundBuyer <- true;
+				}
+			}
+		}
+	}
+}
+
+species Participant skills: [fipa] {
+	int willingPrice <- rnd(1, 8000);
+//	int willingPrice <- 5;
+	string participantName <- "undefined";
+	string auctionType <- "japaneseAuction";
+	message messageFromInitiator;
+	
+	action setName(int num) {
+		participantName <- "Participant " + num;
+	}
+	
+//	register what kind of auction it is, read from the first start_conversation message
+	reflex log_informs when: !empty(informs){
+		loop i over: informs {
+		
+			list contentFromAuctioneer <- i.contents;
+			auctionType <- contentFromAuctioneer[1];
+		}
+	}
+	
+	reflex respond_to_japanese_cfps when: !empty(cfps) and auctionType = "japaneseAuction" {
+		loop c over: cfps {
+			message fromAuctioneer <- c;
+			list contentFromAuctioneer <- c.contents;
+			int currentPrice <- contentFromAuctioneer[1];
+			
+			if(currentPrice > willingPrice){
+				do propose with: (message: c, contents: ['I am willing to stay at current price', false, willingPrice]);
+			} else {
+				do propose with: (message: c, contents: ['I wish to leave', true, willingPrice]);
+			}
+		}
+	}
+			
+	// cfp responses for dutch auction and sealed bid auction, since their responses are the same (participant perspective)
+	reflex respond_to_cfps when: (!empty(cfps)) and (auctionType = "dutchAuction" or auctionType = "sealedBidAuction") {
+		loop c over: cfps {
+			message fromAuctioneer <- c;
+			list contentFromAuctioneer <- c.contents;
+			write  "(Time " + string(time) + " ): " + participantName + " receives a message from auctioneer with content " + string(c.contents);
+			write "Willing to buy for " + willingPrice;
+
+			int auctioneerPrice <- contentFromAuctioneer[1];
+			
+			if(auctioneerPrice > willingPrice){
+				write participantName + " rejects " + auctioneerPrice;
+			} else {
+				write participantName + " accepts " + auctioneerPrice;
+			}
+			
+			do propose with: (message: c, contents: ['Willing to buy for: ', willingPrice]);
+		}
+	}	
+	
+	reflex print_rejected when: !empty(reject_proposals) {
+		loop r over: reject_proposals {
+			write participantName + " has received a reject proposal for: " + string(r.contents);
+		}
+	}
+	
+	reflex print_accepted when: !empty(accept_proposals) {
+		loop a over: accept_proposals {
+			write participantName + " has received an accept proposal for: " + string(a.contents);
+			// do inform result message
+		}
+	}
+}
+
+experiment myExperiment type:gui {
+	output {
+		display myDisplay {
+			//species Person aspect:base;
+		}
+	}
+}
